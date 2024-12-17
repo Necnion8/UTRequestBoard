@@ -1,9 +1,12 @@
 import asyncio
+import datetime
 import uuid
 from logging import getLogger
+from pathlib import Path
 
-import discord
+import discord.channel
 
+from database.option import SQLiteOption
 from dncore import DNCoreAPI
 from dncore.abc.serializables import Embed, MessageId, ChannelId
 from dncore.command import oncommand, DEFAULT_GUILD_OWNER_GROUP, CommandContext
@@ -11,8 +14,11 @@ from dncore.command.errors import CommandUsageError
 from dncore.discord.events import ReadyEvent
 from dncore.event import onevent
 from dncore.plugin import Plugin
+from .abc import *
 from .inter import *
 from .config import RequestBoardConfig, Board
+from .database import RequestBoardDatabase
+from .database.option import MySQLOption
 
 log = getLogger(__name__)
 
@@ -21,18 +27,43 @@ class RequestBoardPlugin(Plugin):
     def __init__(self):
         self.use_intents = discord.Intents.guilds
         self.config = RequestBoardConfig(self.data_dir / "config.yml")
+        self.db = RequestBoardDatabase()
         self._init_discord_ok = False
 
     async def on_enable(self):
         self.config.load()
+        await self.init_database()
 
         if not self._init_discord_ok and ((client := DNCoreAPI.client()) and client.is_ready()):
             await self._init_discord()
+
+    async def on_disable(self):
+        await self.close_database()
 
     @onevent(monitor=True)
     async def on_ready(self, _: ReadyEvent):
         if not self._init_discord_ok:
             await self._init_discord()
+
+    async def init_database(self):
+        if self.config.database.type == "mysql":
+            conf = self.config.database.mysql
+            await self.db.connect(MySQLOption(
+                host=conf.host,
+                port=conf.port,
+                database=conf.database,
+                username=conf.username,
+                password=conf.password,
+            ))
+        else:
+            conf = self.config.database.sqlite
+            Path(conf.path).parent.mkdir(exist_ok=True)
+            await self.db.connect(SQLiteOption(
+                file_path=conf.path,
+            ))
+
+    async def close_database(self):
+        await self.db.close()
 
     async def _init_discord(self):
         if not (client := DNCoreAPI.client()):
@@ -45,6 +76,8 @@ class RequestBoardPlugin(Plugin):
                 client.add_view(self.create_new_request_view(board, b_id))
             # check message content
             await asyncio.create_task(self.update_panel_content(board))
+
+    #
 
     async def update_panel_content(self, board: Board):
         if not (m_id := board.panel_message) or m_id.id is None or m_id.channel_id is None:
@@ -78,7 +111,7 @@ class RequestBoardPlugin(Plugin):
 
         async def on_submit(inter: discord.Interaction, res: discord.InteractionResponse, values: RequestValues):
             try:
-                result = await self.send_new_request(board, values, inter.user)
+                result = await self.create_and_send_new_request(board, values, inter.user)
             except Exception as e:
                 log.exception("Exception in send_new_request", exc_info=e)
                 raise
@@ -100,7 +133,7 @@ class RequestBoardPlugin(Plugin):
 
         return create_new_request_view(b_id, on_click)
 
-    async def send_new_request(self, board: Board, values: RequestValues, user: discord.User) -> bool:
+    async def create_and_send_new_request(self, board: Board, values: RequestValues, user: discord.User) -> bool:
         if not (ch_id := board.forum_channel.id):
             log.warning("フォーラムチャンネルIDが未設定です: b_id: %s", board.new_request_button_id)
             return False
@@ -117,11 +150,33 @@ class RequestBoardPlugin(Plugin):
                         ch_id, board.new_request_button_id)
             return False
 
-        return await self.create_request_thread(channel, board, values, user)
+        if th_m := await self.create_request_thread(channel, board, values, user):
+            await self.db.add_order(RequestOrder(
+                board_id=board.id,
+                created=datetime.datetime.now(),
+                discord_user=user.id,
+                mcid=values.mcid,
+                title=values.title,
+                content=values.content,
+                forum_message=th_m.message.id,
+                forum_message_channel=th_m.message.channel.id,
+            ))
+            return True
+        return False
+
+    def create_discussion_channel_view(self):
+
+        async def on_click(inter: discord.Interaction, res: discord.InteractionResponse):
+            # inter.message.id
+            # await res.send_modal(modal)
+            pass
+
+        return create_discussion_channel_view(on_click)
 
     # noinspection PyMethodMayBeStatic
-    async def create_request_thread(self, channel: discord.ForumChannel,
-                                    board: Board, values: RequestValues, user: discord.User):
+    async def create_request_thread(
+        self, channel: discord.ForumChannel, board: Board, values: RequestValues, user: discord.User,
+    ) -> discord.channel.ThreadWithMessage | None:
 
         em = Embed.info(title=values.title, content=None)
         if values.content:
@@ -129,15 +184,13 @@ class RequestBoardPlugin(Plugin):
         em.add_field(name="MCID", value=values.mcid)
         em.add_field(name="送信者", value=user.mention)
 
-        view = AAAA  # TODO: current work
+        view = self.create_discussion_channel_view()
 
         try:
-            _ = await channel.create_thread(name=values.title, embed=em, view=view)
+            return await channel.create_thread(name=values.title, embed=em, view=view)
         except discord.HTTPException as e:
             log.error(f"スレッドを作成/送信できませんでした: チャンネル {channel.id}: {e}")
-            return False
-
-        return True
+            return
 
     async def send_panel_message(self, board: Board, channel: discord.abc.Messageable, **kwargs):
         fmt = board.panel_format or self.config.panel_format
@@ -208,6 +261,7 @@ class RequestBoardPlugin(Plugin):
                 return await ctx.send_warn(f":warning: <#{forum_channel_id}> チャンネルがフォーラムチャンネルではありません")
 
             board = Board()
+            board.id = uuid.uuid4()
             board.guild = ctx.guild.id
             board.panel_message = MessageId(message_id=None, channel_id=panel_channel.id)
             board.forum_channel = ChannelId(forum_channel_id)
