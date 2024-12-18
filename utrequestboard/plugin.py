@@ -2,11 +2,10 @@ import asyncio
 import datetime
 import uuid
 from logging import getLogger
-from pathlib import Path
+from uuid import UUID
 
 import discord.channel
 
-from database.option import SQLiteOption
 from dncore import DNCoreAPI
 from dncore.abc.serializables import Embed, MessageId, ChannelId
 from dncore.command import oncommand, DEFAULT_GUILD_OWNER_GROUP, CommandContext
@@ -15,10 +14,10 @@ from dncore.discord.events import ReadyEvent
 from dncore.event import onevent
 from dncore.plugin import Plugin
 from .abc import *
-from .inter import *
 from .config import RequestBoardConfig, Board
 from .database import RequestBoardDatabase
-from .database.option import MySQLOption
+from .database.option import SQLiteOption, MySQLOption
+from .inter import *
 
 log = getLogger(__name__)
 
@@ -29,6 +28,8 @@ class RequestBoardPlugin(Plugin):
         self.config = RequestBoardConfig(self.data_dir / "config.yml")
         self.db = RequestBoardDatabase()
         self._init_discord_ok = False
+        #
+        self.discussion_create_channel_view = self.create_discussion_channel_view()
 
     async def on_enable(self):
         self.config.load()
@@ -57,9 +58,10 @@ class RequestBoardPlugin(Plugin):
             ))
         else:
             conf = self.config.database.sqlite
-            Path(conf.path).parent.mkdir(exist_ok=True)
+            db_path = self.data_dir / conf.path
+            db_path.parent.mkdir(exist_ok=True)
             await self.db.connect(SQLiteOption(
-                file_path=conf.path,
+                file_path=db_path.as_posix(),
             ))
 
     async def close_database(self):
@@ -69,6 +71,8 @@ class RequestBoardPlugin(Plugin):
         if not (client := DNCoreAPI.client()):
             self._init_discord_ok = True
             return
+
+        client.add_view(self.discussion_create_channel_view)
 
         for board in self.config.boards:
             # register interaction
@@ -151,7 +155,7 @@ class RequestBoardPlugin(Plugin):
             return False
 
         if th_m := await self.create_request_thread(channel, board, values, user):
-            await self.db.add_order(RequestOrder(
+            order_id = await self.db.add_order(RequestOrder(
                 board_id=board.id,
                 created=datetime.datetime.now(),
                 discord_user=user.id,
@@ -161,15 +165,89 @@ class RequestBoardPlugin(Plugin):
                 forum_message=th_m.message.id,
                 forum_message_channel=th_m.message.channel.id,
             ))
+            log.info("Created order (%s) by '%s' %s/%s", order_id, str(user), values.mcid, values.title)
             return True
         return False
 
     def create_discussion_channel_view(self):
 
         async def on_click(inter: discord.Interaction, res: discord.InteractionResponse):
-            # inter.message.id
-            # await res.send_modal(modal)
-            pass
+            order = await self.db.get_order_by_forum_message_id(inter.message.id)
+            if not order:
+                log.warning("Cannot find order (from forum message '%s') by %s",
+                            inter.message.id, inter.user)
+                try:
+                    await res.send_message(
+                        embed=Embed.error(":warning: リクエスト内容がデータベースから見つかりませんでした"),
+                        ephemeral=True,
+                        delete_after=6,
+                    )
+                except (Exception,):
+                    pass
+                return
+
+            if order.discussion_channel:
+                try:
+                    await inter.client.fetch_channel(order.discussion_channel)
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException:
+                    try:
+                        await res.send_message(
+                            embed=Embed.error(f":warning: すでにチャンネルが作成されています: <#{order.discussion_channel}>"),
+                            ephemeral=True,
+                            delete_after=6,
+                        )
+                    except (Exception,):
+                        pass
+                    return
+                else:
+                    try:
+                        await res.send_message(
+                            embed=Embed.error(f":warning: すでにチャンネルが作成されています: <#{order.discussion_channel}>"),
+                            ephemeral=True,
+                            delete_after=6,
+                        )
+                    except (Exception,):
+                        pass
+                    return
+
+            if not (board := self.get_board(order.board_id)):
+                log.warning("Unknown board id: %s by %s", order.board_id, inter.user)
+                try:
+                    await res.send_message(
+                        embed=Embed.error(
+                            f":warning: すでにチャンネルが作成されています: <#{order.discussion_channel}>"),
+                        ephemeral=True,
+                        delete_after=6,
+                    )
+                except (Exception,):
+                    pass
+                return
+
+            if not (discussion := await self.create_discussion_channel(board, order)):
+                log.warning("No settings discussion channel: board %s", order.board_id)
+                try:
+                    await res.send_message(
+                        embed=Embed.error(
+                            f":warning: 設定が不十分か、エラーが発生しました。ログを確認してください。"),
+                        ephemeral=True,
+                        delete_after=6,
+                    )
+                except (Exception,):
+                    pass
+                return
+
+            try:
+                await res.send_message(
+                    embed=Embed.info(
+                        f":ok_hand: チャンネルが作成されました: <#{discussion.id}>"),
+                    ephemeral=True,
+                    delete_after=6,
+                )
+            except (Exception,):
+                pass
+            return
 
         return create_discussion_channel_view(on_click)
 
@@ -184,7 +262,7 @@ class RequestBoardPlugin(Plugin):
         em.add_field(name="MCID", value=values.mcid)
         em.add_field(name="送信者", value=user.mention)
 
-        view = self.create_discussion_channel_view()
+        view = self.discussion_create_channel_view
 
         try:
             return await channel.create_thread(name=values.title, embed=em, view=view)
@@ -198,8 +276,56 @@ class RequestBoardPlugin(Plugin):
         m = await channel.send(embed=fmt, view=self.create_new_request_view(board, button_id), **kwargs)
         return m
 
+    async def create_discussion_channel(self, board: Board, order: RequestOrder):
+        if not ((category_id := board.discussion_channel_category) and (category_id := category_id.id)):
+            return None
+
+        try:
+            category = await DNCoreAPI.client().fetch_channel(category_id)
+        except discord.HTTPException as e:
+            log.error(f"Error in get category channel ({category_id}): {e}")
+            return None
+
+        if not isinstance(category, discord.CategoryChannel):
+            log.error("Not a category channel: %s/%s", category.id, category.name)
+            return None
+
+        try:
+            if not (order_user := category.guild.get_member(order.discord_user)):
+                order_user = await category.guild.fetch_member(order.discord_user)
+        except discord.HTTPException as e:
+            log.error(f"Error in get member ({order.discord_user}): {e}")
+            return None
+
+        try:
+            perms = discord.PermissionOverwrite()
+            perms.view_channel = True
+            perms.send_messages = True
+            discussion = await category.guild.create_text_channel(
+                name=order.title,
+                category=category,
+                position=0,
+                overwrites={order_user: perms},
+            )
+        except discord.HTTPException as e:
+            log.error(f"Error in create discussion channel by {order.discord_user}: {e}")
+            return None
+
+        async with self.db.modify_order(order.id) as _order:
+            _order.discussion_channel = discussion.id
+            _order.discussion_closed = None
+
+        log.info("Created discussion channel (%s) by '%s' %s/%s",
+                 order.id, str(order_user), order.mcid, order.title)
+        return discussion
+
     def get_guild_boards(self, guild_id: int):
         return list(filter(lambda b: b.guild == guild_id, self.config.boards))
+
+    def get_board(self, board_id: UUID):
+        for board in self.config.boards:
+            if board.id == board_id:
+                return board
 
     # settings
 

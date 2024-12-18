@@ -55,13 +55,23 @@ class RequestBoardDatabase(object):
             except NoResultFound:
                 return None
 
+    async def get_order_by_forum_message_id(self, forum_message_id: int) -> RequestOrder | None:
+        async with self.session() as db:
+            result = await db.execute(select(RequestOrder).where(RequestOrder.forum_message == forum_message_id))
+            try:
+                return result.one()[0]
+            except NoResultFound:
+                return None
+
     async def add_order(self, order: RequestOrder):
         if order.id is None:
             order.id = uuid.uuid4()
+        order_id = order.id
         async with self._lock:
             async with self.session() as db:
                 db.add(order)
                 await db.commit()
+        return order_id
 
     async def remove_order(self, order: RequestOrder | UUID):
         async with self._lock:

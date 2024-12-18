@@ -1,5 +1,4 @@
-from pathlib import Path
-from typing import NamedTuple
+from dataclasses import dataclass, field
 
 from sqlalchemy import URL
 
@@ -14,29 +13,27 @@ class DatabaseOption:
         raise NotImplementedError
 
 
-class SQLiteOption(DatabaseOption, NamedTuple):
+@dataclass
+class SQLiteOption(DatabaseOption):
     file_path: str
-    query: dict = dict(
-        charset="utf8mb4",
-    )
+    query: dict = field(default_factory=lambda: dict(charset="utf8mb4"))
 
     def create_url(self) -> URL:
         return URL.create(
             drivername="sqlite+aiosqlite",
-            database=Path(self.file_path).as_posix(),
+            database=self.file_path,
             query=self.query,
         )
 
 
-class MySQLOption(DatabaseOption, NamedTuple):
+@dataclass
+class MySQLOption(DatabaseOption):
     host: str
     port: int
     database: str
     username: str
     password: str
-    query: dict = dict(
-        charset="utf8mb4",
-    )
+    query: dict = field(default_factory=lambda: dict(charset="utf8mb4"))
 
     def create_url(self) -> URL:
         return URL.create(

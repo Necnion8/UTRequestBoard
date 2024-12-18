@@ -27,6 +27,7 @@ class Board(ConfigValues):
     forum_channel: ChannelId
     panel_format: Embed | None = None
     new_request_button_id: str | None = None
+    discussion_channel_category: ChannelId | None
 
     @classmethod
     def _serializers(cls) -> Iterable[ObjectSerializer]:
