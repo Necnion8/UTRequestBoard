@@ -571,8 +571,9 @@ class RequestBoardPlugin(Plugin):
     async def cmd_requestboard(self, ctx: CommandContext):
         """
         {command} [list]
-        {command} add (ﾊﾟﾈﾙﾁｬﾝﾈﾙID) (ﾌｫｰﾗﾑﾁｬﾝﾈﾙID)
+        {command} add (ﾊﾟﾈﾙﾁｬﾝﾈﾙID) (ﾌｫｰﾗﾑﾁｬﾝﾈﾙID) [議論ﾁｬﾝﾈﾙｶﾃｺﾞﾘID]
         {command} <remove/preview/send> (ｲﾝﾃﾞｯｸｽ)
+        {command} setChCate (ｲﾝﾃﾞｯｸｽ) (議論ﾁｬﾝﾈﾙｶﾃｺﾞﾘID / unset)
         """
         args = ctx.args
         try:
@@ -590,7 +591,7 @@ class RequestBoardPlugin(Plugin):
                     channel_name = f"https://discord.com/channels/0/{b.panel_message.channel_id}/{b.panel_message.id}"
                 else:
                     channel_name = f"<#{b.panel_message.channel_id}>"
-                    
+
                 return f"{n}. {channel_name} -> <#{b.forum_channel.id}>"
 
             lines = "\n".join(_format(n, b) for n, b in enumerate(boards, 1))
@@ -622,13 +623,33 @@ class RequestBoardPlugin(Plugin):
                 return await ctx.send_warn(f":warning: <#{forum_channel_id}> にアクセスできません: {e}")
 
             if not isinstance(forum_channel, discord.ForumChannel):
-                return await ctx.send_warn(f":warning: <#{forum_channel_id}> チャンネルがフォーラムチャンネルではありません")
+                return await ctx.send_warn(f":warning: <#{forum_channel_id}> がフォーラムチャンネルではありません")
+
+            discussion_channel_category = None
+            try:
+                discussion_channel_category_id = args.get_channel(0)
+                args.pop(0)
+            except IndexError:
+                pass
+            except ValueError:
+                return await ctx.send_warn(":grey_exclamation: カテゴリチャンネルを数値で指定してください")
+            else:
+                try:
+                    discussion_channel_category = await ctx.client.fetch_channel(discussion_channel_category_id, force=True)
+                except discord.HTTPException as e:
+                    return await ctx.send_warn(f":warning: <#{discussion_channel_category_id}> にアクセスできません: {e}")
+                else:
+                    if not isinstance(discussion_channel_category, discord.CategoryChannel):
+                        return await ctx.send_warn(
+                            f":warning: <#{discussion_channel_category_id}> がカテゴリチャンネルではありません")
 
             board = Board()
             board.id = uuid.uuid4()
             board.guild = ctx.guild.id
             board.panel_message = MessageId(message_id=None, channel_id=panel_channel.id)
             board.forum_channel = ChannelId(forum_channel_id)
+            if discussion_channel_category:
+                board.discussion_channel_category = discussion_channel_category.id
 
             self.config.boards.append(board)
             self.config.save()
@@ -770,6 +791,52 @@ class RequestBoardPlugin(Plugin):
             board.panel_message = MessageId(m.id, m.channel.id)
             self.config.save()
             await ctx.send_info(f":ok_hand: パネルメッセージを送信しました: {m.jump_url}")
+
+        elif mode in ("setchannelcategory", "setchcate"):
+            try:
+                board_index = int(args.pop(0))
+            except IndexError:
+                return await ctx.send_warn(":grey_exclamation: ボード番号を指定してください")
+            except ValueError:
+                return await ctx.send_warn(":grey_exclamation: ボード番号を数値で指定してください")
+
+            boards = self.get_guild_boards(ctx.guild.id)
+            try:
+                if not 0 < board_index <= len(boards):
+                    raise IndexError
+                board = boards[board_index - 1]
+            except IndexError:
+                return await ctx.send_warn(f":warning: 1 から {len(boards)} で指定してください")
+
+            if (args.get(0) or "").lower() == "unset":
+                board.discussion_channel_category = None
+
+            else:
+                try:
+                    discussion_channel_category_id = args.get_channel(0)
+                    args.pop(0)
+                except IndexError:
+                    raise CommandUsageError()
+                except ValueError:
+                    return await ctx.send_warn(":grey_exclamation: カテゴリチャンネルを数値で指定してください")
+                else:
+                    try:
+                        discussion_channel_category = await ctx.client.fetch_channel(discussion_channel_category_id, force=True)
+                    except discord.HTTPException as e:
+                        return await ctx.send_warn(f":warning: <#{discussion_channel_category_id}> にアクセスできません: {e}")
+                    else:
+                        if not isinstance(discussion_channel_category, discord.CategoryChannel):
+                            return await ctx.send_warn(
+                                f":warning: <#{discussion_channel_category_id}> がカテゴリチャンネルではありません")
+                board.discussion_channel_category = discussion_channel_category.id
+
+            self.config.save()
+            if board.discussion_channel_category:
+                m_text = "議論チャンネルを作成するカテゴリチャンネルを設定しました"
+            else:
+                m_text = "議論チャンネルの設定を解除しました"
+
+            return await ctx.send_info(f":ok_hand: {m_text}")
 
         else:
             raise CommandUsageError()
