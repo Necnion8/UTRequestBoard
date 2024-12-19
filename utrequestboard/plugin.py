@@ -22,6 +22,29 @@ from .inter import *
 log = getLogger(__name__)
 
 
+def create_request_form_embed(order: RequestOrder):
+    em = Embed.info(title=order.title, content=None)
+    if order.content:
+        em.description = "**詳細内容**\n> " + "\n> ".join(order.content.split("\n"))
+    em.add_field(name="MCID", value=order.mcid)
+    em.add_field(name="送信者", value=f"<@{order.discord_user}>")
+    if ch_id := order.discussion_channel:
+        em.add_field(name="議論チャンネル", value=f"<#{ch_id}>")
+    return em
+
+
+def get_discussion_user_permission():
+    return discord.PermissionOverwrite(
+        view_channel=True,
+    )
+
+
+def get_me_permission():
+    return discord.PermissionOverwrite(
+        manage_permissions=True,
+    )
+
+
 class RequestBoardPlugin(Plugin):
     def __init__(self):
         self.use_intents = discord.Intents.guilds
@@ -30,6 +53,8 @@ class RequestBoardPlugin(Plugin):
         self._init_discord_ok = False
         #
         self.discussion_create_channel_view = self.create_discussion_channel_view()
+        self.discussion_close_channel_view = self.create_discussion_close_channel_view()
+        self.discussion_reopen_channel_view = self.create_discussion_reopen_channel_view()
 
     async def on_enable(self):
         self.config.load()
@@ -73,6 +98,8 @@ class RequestBoardPlugin(Plugin):
             return
 
         client.add_view(self.discussion_create_channel_view)
+        client.add_view(self.discussion_close_channel_view)
+        client.add_view(self.discussion_reopen_channel_view)
 
         for board in self.config.boards:
             # register interaction
@@ -154,17 +181,19 @@ class RequestBoardPlugin(Plugin):
                         ch_id, board.new_request_button_id)
             return False
 
-        if th_m := await self.create_request_thread(channel, board, values, user):
-            order_id = await self.db.add_order(RequestOrder(
-                board_id=board.id,
-                created=datetime.datetime.now(),
-                discord_user=user.id,
-                mcid=values.mcid,
-                title=values.title,
-                content=values.content,
-                forum_message=th_m.message.id,
-                forum_message_channel=th_m.message.channel.id,
-            ))
+        order = RequestOrder(
+            board_id=board.id,
+            created=datetime.datetime.now(),
+            discord_user=user.id,
+            mcid=values.mcid,
+            title=values.title,
+            content=values.content,
+        )
+
+        if th_m := await self.create_request_thread(channel, order):
+            order.forum_message = th_m.message.id
+            order.forum_message_channel = th_m.message.channel.id
+            order_id = await self.db.add_order(order)
             log.info("Created order (%s) by '%s' %s/%s", order_id, str(user), values.mcid, values.title)
             return True
         return False
@@ -225,19 +254,7 @@ class RequestBoardPlugin(Plugin):
                     pass
                 return
 
-            if not (discussion := await self.create_discussion_channel(board, order)):
-                log.warning("No settings discussion channel: board %s", order.board_id)
-                try:
-                    await res.send_message(
-                        embed=Embed.error(
-                            f":warning: 設定が不十分か、エラーが発生しました。ログを確認してください。"),
-                        ephemeral=True,
-                        delete_after=6,
-                    )
-                except (Exception,):
-                    pass
-                return
-
+            discussion = await self.create_discussion_channel(board, order)
             try:
                 await res.send_message(
                     embed=Embed.info(
@@ -249,23 +266,17 @@ class RequestBoardPlugin(Plugin):
                 pass
             return
 
-        return create_discussion_channel_view(on_click)
+        return create_single_button_view("open_discussion_channel", "チャンネルを作成", on_click)
 
-    # noinspection PyMethodMayBeStatic
     async def create_request_thread(
-        self, channel: discord.ForumChannel, board: Board, values: RequestValues, user: discord.User,
+        self, channel: discord.ForumChannel, order: RequestOrder,
     ) -> discord.channel.ThreadWithMessage | None:
 
-        em = Embed.info(title=values.title, content=None)
-        if values.content:
-            em.description = "**詳細内容**\n> " + "\n> ".join(values.content.split("\n"))
-        em.add_field(name="MCID", value=values.mcid)
-        em.add_field(name="送信者", value=user.mention)
-
+        em = create_request_form_embed(order)
         view = self.discussion_create_channel_view
 
         try:
-            return await channel.create_thread(name=values.title, embed=em, view=view)
+            return await channel.create_thread(name=order.title, embed=em, view=view)
         except discord.HTTPException as e:
             log.error(f"スレッドを作成/送信できませんでした: チャンネル {channel.id}: {e}")
             return
@@ -276,40 +287,51 @@ class RequestBoardPlugin(Plugin):
         m = await channel.send(embed=fmt, view=self.create_new_request_view(board, button_id), **kwargs)
         return m
 
+    @staticmethod
+    def create_discussion_channel_permission_overwrites(me: discord.Member, user: discord.Member):
+        perms = discord.PermissionOverwrite()
+        # noinspection PyDunderSlots,PyUnresolvedReferences
+        perms.view_channel = True
+        me_perms = discord.PermissionOverwrite()
+        # noinspection PyDunderSlots,PyUnresolvedReferences
+        # me_perms.manage_permissions = True  # なぜかカテゴリへの権限のみでは不十分だったので
+        return {user: perms, me: me_perms}  # TODO: 閉じるが効かなくなる
+
     async def create_discussion_channel(self, board: Board, order: RequestOrder):
         if not ((category_id := board.discussion_channel_category) and (category_id := category_id.id)):
-            return None
+            raise ReadableError("カテゴリチャンネルが設定されていません")
 
         try:
             category = await DNCoreAPI.client().fetch_channel(category_id)
         except discord.HTTPException as e:
             log.error(f"Error in get category channel ({category_id}): {e}")
-            return None
+            raise ReadableError("カテゴリチャンネルを取得できませんでした")
 
         if not isinstance(category, discord.CategoryChannel):
             log.error("Not a category channel: %s/%s", category.id, category.name)
-            return None
+            raise ReadableError("カテゴリではないチャンネルがカテゴリチャンネルとして設定されています")
 
         try:
             if not (order_user := category.guild.get_member(order.discord_user)):
                 order_user = await category.guild.fetch_member(order.discord_user)
         except discord.HTTPException as e:
             log.error(f"Error in get member ({order.discord_user}): {e}")
-            return None
+            raise ReadableError("リクエストユーザーを取得できませんでした")
 
         try:
-            perms = discord.PermissionOverwrite()
-            perms.view_channel = True
-            perms.send_messages = True
             discussion = await category.guild.create_text_channel(
                 name=order.title,
                 category=category,
                 position=0,
-                overwrites={order_user: perms},
+                overwrites={
+                    category.guild.me: get_me_permission(),
+                    order_user: get_discussion_user_permission(),
+                },
             )
+
         except discord.HTTPException as e:
             log.error(f"Error in create discussion channel by {order.discord_user}: {e}")
-            return None
+            raise ReadableError(f"チャンネルを作成できませんでした: {e}")
 
         async with self.db.modify_order(order.id) as _order:
             _order.discussion_channel = discussion.id
@@ -317,7 +339,223 @@ class RequestBoardPlugin(Plugin):
 
         log.info("Created discussion channel (%s) by '%s' %s/%s",
                  order.id, str(order_user), order.mcid, order.title)
+
+        order = await self.db.get_order(order.id)
+        DNCoreAPI.run_coroutine(self.update_board_forum_message(order))
         return discussion
+
+    async def update_board_forum_message(self, order: RequestOrder):
+        if not (m_id := order.forum_message) or not (ch_id := order.forum_message_channel):
+            return False
+
+        try:
+            channel = await DNCoreAPI.client().fetch_channel(ch_id)
+            message = await channel.fetch_message(m_id)
+        except discord.NotFound:
+            return False
+        except discord.HTTPException as e:
+            log.warning(f"Unable to update forum board message: {e}")
+            return False
+
+        em = create_request_form_embed(order)
+        if not order.discussion_channel:
+            view = self.discussion_create_channel_view
+        elif order.discussion_closed:
+            view = self.discussion_reopen_channel_view
+        else:
+            view = self.discussion_close_channel_view
+
+        try:
+            await message.edit(embed=em, view=view)
+        except discord.HTTPException as e:
+            log.warning(f"Error in update forum board message: {e}")
+            return False
+        return True
+
+    async def on_close_channel_button(self, inter: discord.Interaction, res: discord.InteractionResponse):
+        order = await self.db.get_order_by_forum_message_id(inter.message.id)
+        if not order:
+            log.warning("Cannot find order (from forum message '%s') by %s",
+                        inter.message.id, inter.user)
+            try:
+                await res.send_message(
+                    embed=Embed.error(":warning: リクエスト内容がデータベースから見つかりませんでした"),
+                    ephemeral=True,
+                    delete_after=6,
+                )
+            except (Exception,):
+                pass
+            return
+
+        channel = None
+        if order.discussion_channel:
+            try:
+                channel = await inter.client.fetch_channel(order.discussion_channel)
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as e:
+                log.warning("Cannot fetch channel (%s): %s", order.discussion_channel, str(e))
+                try:
+                    await res.send_message(
+                        embed=Embed.error(
+                            f":warning: チャンネルを参照できませんでした: <#{order.discussion_channel}>"),
+                        ephemeral=True,
+                        delete_after=6,
+                    )
+                except (Exception,):
+                    pass
+                return
+
+        if not channel:
+            try:
+                await res.send_message(
+                    embed=Embed.error(":warning: チャンネルが見つかりませんでした"),
+                    ephemeral=True,
+                    delete_after=6,
+                )
+            except (Exception,):
+                pass
+            return
+
+        await self.update_discussion_channel_closed(order, channel)
+        try:
+            await res.send_message(
+                embed=Embed.info(
+                    f":ok_hand: チャンネルを閉じました: <#{channel.id}>"),
+                ephemeral=True,
+                delete_after=6,
+            )
+        except (Exception,):
+            pass
+
+    def create_discussion_close_channel_view(self):
+        return create_single_button_view(
+            "close_discussion_channel",
+            "チャンネルを閉じる",
+            self.on_close_channel_button,
+        )
+
+    async def on_reopen_channel_button(self, inter: discord.Interaction, res: discord.InteractionResponse):
+        order = await self.db.get_order_by_forum_message_id(inter.message.id)
+        if not order:
+            log.warning("Cannot find order (from forum message '%s') by %s",
+                        inter.message.id, inter.user)
+            try:
+                await res.send_message(
+                    embed=Embed.error(":warning: リクエスト内容がデータベースから見つかりませんでした"),
+                    ephemeral=True,
+                    delete_after=6,
+                )
+            except (Exception,):
+                pass
+            return
+
+        channel = None
+        if order.discussion_channel:
+            try:
+                channel = await inter.client.fetch_channel(order.discussion_channel)
+            except discord.NotFound:
+                pass
+            except discord.HTTPException as e:
+                log.warning("Cannot fetch channel (%s): %s", order.discussion_channel, str(e))
+                try:
+                    await res.send_message(
+                        embed=Embed.error(
+                            f":warning: チャンネルを参照できませんでした: <#{order.discussion_channel}>"),
+                        ephemeral=True,
+                        delete_after=6,
+                    )
+                except (Exception,):
+                    pass
+                return
+
+        if not channel:
+            if not (board := self.get_board(order.board_id)):
+                raise ReadableError("ボード設定が見つかりません")
+
+            discussion = await self.create_discussion_channel(board, order)
+            try:
+                await res.send_message(
+                    embed=Embed.info(
+                        f":ok_hand: チャンネルが作成されました: <#{discussion.id}>"),
+                    ephemeral=True,
+                    delete_after=6,
+                )
+            except (Exception,):
+                pass
+            return
+
+        await self.update_discussion_channel_reopen(order, channel)
+        try:
+            await res.send_message(
+                embed=Embed.info(
+                    f":ok_hand: チャンネルを開きました: <#{channel.id}>"),
+                ephemeral=True,
+                delete_after=6,
+            )
+        except (Exception,):
+            pass
+
+    def create_discussion_reopen_channel_view(self):
+        return create_single_button_view(
+            "reopen_discussion_channel",
+            "チャンネルを開く",
+            self.on_reopen_channel_button,
+        )
+
+    async def update_discussion_channel_closed(self, order: RequestOrder, channel: discord.TextChannel):
+        try:
+            if not (order_user := channel.guild.get_member(order.discord_user)):
+                order_user = await channel.guild.fetch_member(order.discord_user)
+        except discord.HTTPException as e:
+            log.error(f"Error in get member ({order.discord_user}): {e}")
+            raise ReadableError("リクエストユーザーを取得できませんでした")
+
+        try:
+            await channel.set_permissions(order_user, overwrite=None)
+            # await channel.edit(name="closed-" + order.title)
+
+        except discord.HTTPException as e:
+            log.error(f"Error in update discussion channel {channel.id}: {e}")
+            raise ReadableError("チャンネルを編集できませんでした")
+
+        async with self.db.modify_order(order.id) as _order:
+            # _order.discussion_channel = None
+            _order.discussion_closed = datetime.datetime.now()
+
+        log.info("Closed discussion channel (%s) by '%s' %s/%s",
+                 order.id, str(order_user), order.mcid, order.title)
+
+        order = await self.db.get_order(order.id)
+        DNCoreAPI.run_coroutine(self.update_board_forum_message(order))
+        return True
+
+    async def update_discussion_channel_reopen(self, order: RequestOrder, channel: discord.TextChannel):
+        try:
+            if not (order_user := channel.guild.get_member(order.discord_user)):
+                order_user = await channel.guild.fetch_member(order.discord_user)
+        except discord.HTTPException as e:
+            log.error(f"Error in get member ({order.discord_user}): {e}")
+            raise ReadableError("リクエストユーザーを取得できませんでした")
+
+        try:
+            await channel.set_permissions(order_user, overwrite=get_discussion_user_permission())
+            await channel.edit(name=order.title)
+
+        except discord.HTTPException as e:
+            log.error(f"Error in update discussion channel {channel.id}: {e}")
+            raise ReadableError("チャンネルを編集できませんでした")
+
+        async with self.db.modify_order(order.id) as _order:
+            _order.discussion_channel = channel.id
+            _order.discussion_closed = None
+
+        log.info("Reopen discussion channel (%s) by '%s' %s/%s",
+                 order.id, str(order_user), order.mcid, order.title)
+
+        order = await self.db.get_order(order.id)
+        DNCoreAPI.run_coroutine(self.update_board_forum_message(order))
+        return True
 
     def get_guild_boards(self, guild_id: int):
         return list(filter(lambda b: b.guild == guild_id, self.config.boards))

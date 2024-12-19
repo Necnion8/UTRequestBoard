@@ -4,7 +4,13 @@ from sqlalchemy.orm import declarative_base
 __all__ = [
     "Base",
     "RequestOrder",
+    "ReadableError",
 ]
+
+
+class ReadableError(Exception):
+    pass
+
 
 Base = declarative_base()
 

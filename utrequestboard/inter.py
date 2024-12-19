@@ -6,17 +6,29 @@ from discord import Interaction
 from discord._types import ClientT
 
 from dncore.abc.serializables import Embed
+from .abc import ReadableError
 
 log = getLogger(__name__)
 __all__ = [
     "custom_id_new_request_prefix",
     "create_new_request_view",
-    "create_discussion_channel_view",
+    "create_single_button_view",
     "RequestValues",
     "create_request_modal",
 ]
 custom_id_new_request_prefix = "dncore:utrequestboard:new_request:"
-custom_id_open_discussion_channel = "dncore:utrequestboard:open_discussion_channel"
+custom_id_prefix = "dncore:utrequestboard:"
+
+
+async def handle_error(error: BaseException, res: discord.InteractionResponse):
+    try:
+        await res.send_message(embed=Embed.error(
+            f":warning: {str(error)}" if isinstance(error, ReadableError) else ":warning: 内部エラーが発生しました。"
+        ), ephemeral=True, delete_after=15 if isinstance(error, ReadableError) else 6)
+    except discord.HTTPException as e:
+        log.warning(f"Failed to send response: {e}")
+    except Exception as e:
+        log.warning(f"Failed to send response", exc_info=e)
 
 
 def create_new_request_view(id: str, on_click: Callable[[discord.InteractionResponse], Awaitable[None]]):
@@ -31,40 +43,27 @@ def create_new_request_view(id: str, on_click: Callable[[discord.InteractionResp
                 await on_click(res)
             except Exception as e:
                 log.exception("Exception in handling button new_request", exc_info=e)
-                try:
-                    await res.send_message(
-                        embed=Embed.error(":warning: 内部エラーが発生しました。"),
-                        ephemeral=True,
-                        delete_after=6,
-                    )
-                except (Exception,):
-                    pass
+                await handle_error(e, res)
 
     return NewRequestView(timeout=None)
 
 
-def create_discussion_channel_view(on_click: Callable[[discord.Interaction, discord.InteractionResponse], Awaitable[None]]):
-    custom_id = custom_id_open_discussion_channel
+def create_single_button_view(
+    button_id: str, label: str, on_click: Callable[[discord.Interaction, discord.InteractionResponse], Awaitable[None]],
+):
 
-    class OpenDiscussionChannelView(discord.ui.View):
-        @discord.ui.button(custom_id=custom_id, label="チャンネルを作成")
+    class CreateDiscussionChannelView(discord.ui.View):
+        @discord.ui.button(custom_id=custom_id_prefix + button_id, label=label)
         async def click_new(self, inter: discord.Interaction, _):
             # noinspection PyTypeChecker
             res: discord.InteractionResponse = inter.response
             try:
                 await on_click(inter, res)
             except Exception as e:
-                log.exception("Exception in handling button open_discussion", exc_info=e)
-                try:
-                    await res.send_message(
-                        embed=Embed.error(":warning: 内部エラーが発生しました。"),
-                        ephemeral=True,
-                        delete_after=6,
-                    )
-                except (Exception,):
-                    pass
+                log.exception("Exception in handling button %s", button_id, exc_info=e)
+                await handle_error(e, res)
 
-    return OpenDiscussionChannelView(timeout=None)
+    return CreateDiscussionChannelView(timeout=None)
 
 
 class RequestValues(NamedTuple):
@@ -92,13 +91,6 @@ def create_request_modal(
                 ))
             except Exception as e:
                 log.exception("Exception in handling submit request", exc_info=e)
-                try:
-                    await res.send_message(
-                        embed=Embed.error(":warning: 内部エラーが発生しました。"),
-                        ephemeral=True,
-                        delete_after=6,
-                    )
-                except (Exception,):
-                    pass
+                await handle_error(e, res)
 
     return RequestModal()
