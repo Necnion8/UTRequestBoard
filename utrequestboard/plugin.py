@@ -45,6 +45,13 @@ def get_me_permission():
     )
 
 
+async def send_discussion_channel_new_message(channel: discord.TextChannel, order: RequestOrder):
+    await channel.send(
+        content=f"<@{order.discord_user}>",
+        embed=Embed.info("運営により議論チャンネルが作成されました"),
+    )
+
+
 class RequestBoardPlugin(Plugin):
     def __init__(self):
         self.use_intents = discord.Intents.guilds
@@ -342,6 +349,7 @@ class RequestBoardPlugin(Plugin):
 
         order = await self.db.get_order(order.id)
         DNCoreAPI.run_coroutine(self.update_board_forum_message(order))
+        DNCoreAPI.run_coroutine(send_discussion_channel_new_message(discussion, order))
         return discussion
 
     async def update_board_forum_message(self, order: RequestOrder):
@@ -808,9 +816,8 @@ class RequestBoardPlugin(Plugin):
             except IndexError:
                 return await ctx.send_warn(f":warning: 1 から {len(boards)} で指定してください")
 
-            if (args.get(0) or "").lower() == "unset":
+            if args.get(0, "").lower() == "unset":
                 board.discussion_channel_category = None
-
             else:
                 try:
                     discussion_channel_category_id = args.get_channel(0)
