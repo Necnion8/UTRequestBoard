@@ -1,6 +1,6 @@
 main: utrequestboard.plugin.RequestBoardPlugin
 name: UTRequestBoard
-version: "1.0.0/241209"
+version: "1.0.0/241220"
 dncore: 6.0.0
 description: "リクエスト作成パネルを設置し、特定のフォーラムチャンネルに投稿を作成します"
 website: "https://github.com/Necnion8/UTRequestBoard"
